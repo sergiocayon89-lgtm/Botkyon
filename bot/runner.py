@@ -5,11 +5,13 @@ import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from strategy import Candle, evaluate, Params, position_size
+from strategy import (Candle, evaluate, Params, position_size,
+                      session_vwap, ema, session_levels, near_level)
 
 STATE_FILE = os.environ.get("BOT_STATE_FILE", "state.json")
 SYMBOL = os.environ.get("BOT_SYMBOL", "AAPL")
 POLL_SECONDS = int(os.environ.get("BOT_POLL_SECONDS", "60"))
+TRADE_24H = os.environ.get("BOT_24H", "1") == "1"
 
 _lock = threading.Lock()
 STATE = {
@@ -27,6 +29,12 @@ STATE = {
     "trades": [],
     "last_eval": None,
     "last_error": None,
+    "candles": [],        # recent 1m candles for the chart: [t,o,h,l,c]
+    "ema9_series": [],     # [t, value] aligned to candles
+    "vwap_series": [],     # [t, value]
+    "markers": [],         # buy/sell arrows: {time, price, side}
+    "session_high": None,
+    "session_low": None,
 }
 
 
@@ -51,6 +59,9 @@ def _log_trade(action, reason, details, extra=None):
 
 
 def in_no_trade_window(now_utc):
+    # 24h mode: never blocked. Otherwise restrict to US regular session.
+    if TRADE_24H:
+        return False
     minutes = now_utc.hour * 60 + now_utc.minute
     open_m, close_m = 13 * 60 + 30, 20 * 60
     if minutes < open_m or minutes >= close_m:
@@ -88,12 +99,47 @@ def cycle(broker):
             STATE["last_eval"] = {"time": now.isoformat(timespec="seconds"), "action": "HOLD", "reason": "Outside trading window."}
         _save()
         return
-    c1 = [Candle(b.ts, b.open, b.high, b.low, b.close, b.volume) for b in broker.recent_bars(STATE["symbol"], 1, 60)]
+
+    raw1 = broker.recent_bars(STATE["symbol"], 1, 120)
+    c1 = [Candle(b.ts, b.open, b.high, b.low, b.close, b.volume) for b in raw1]
     c5 = [Candle(b.ts, b.open, b.high, b.low, b.close, b.volume) for b in broker.recent_bars(STATE["symbol"], 5, 60)]
     c15 = [Candle(b.ts, b.open, b.high, b.low, b.close, b.volume) for b in broker.recent_bars(STATE["symbol"], 15, 60)]
-    sig = evaluate(c1, c5, c15, p)
+
+    # session levels (use the 1m candles we have for this session view)
+    levels = session_levels(c1)
+
+    # build chart series: candles + rolling ema9 + rolling vwap
+    closes = [c.close for c in c1]
+    candle_rows = [[int(c.ts), round(c.open, 2), round(c.high, 2), round(c.low, 2), round(c.close, 2)] for c in c1]
+    ema_rows = []
+    vwap_rows = []
+    for i in range(len(c1)):
+        sub = closes[:i + 1]
+        e = ema(sub, p.ema_period)
+        if e is not None:
+            ema_rows.append([int(c1[i].ts), round(e, 2)])
+        v = session_vwap(c1[:i + 1])
+        if v is not None:
+            vwap_rows.append([int(c1[i].ts), round(v, 2)])
+
     with _lock:
-        STATE["last_eval"] = {"time": now.isoformat(timespec="seconds"), "action": sig.action, "reason": sig.reason, "details": sig.details}
+        STATE["candles"] = candle_rows[-120:]
+        STATE["ema9_series"] = ema_rows[-120:]
+        STATE["vwap_series"] = vwap_rows[-120:]
+        STATE["session_high"] = round(levels["high"], 2) if levels["high"] else None
+        STATE["session_low"] = round(levels["low"], 2) if levels["low"] else None
+
+    sig = evaluate(c1, c5, c15, p)
+    near_hi = near_level(c1[-1].close, levels["high"]) if c1 else False
+    near_lo = near_level(c1[-1].close, levels["low"]) if c1 else False
+    note = ""
+    if near_hi:
+        note = "  (price testing session HIGH)"
+    elif near_lo:
+        note = "  (price testing session LOW)"
+
+    with _lock:
+        STATE["last_eval"] = {"time": now.isoformat(timespec="seconds"), "action": sig.action, "reason": sig.reason + note, "details": sig.details}
     _save()
     if sig.action == "HOLD":
         return
@@ -113,19 +159,25 @@ def cycle(broker):
         _log_trade("HOLD", "Position size was 0 (stop too wide for risk %).", sig.details)
         return
     trade_meta = {"entry": round(entry, 2), "stop": round(stop, 2), "take_profit": round(tp, 2), "qty": qty, "side": side}
+    marker = {"time": int(c1[-1].ts), "price": round(entry, 2), "side": "buy" if side == "buy" else "sell"}
     if STATE["mode"] == "auto":
         try:
             oid = broker.submit_bracket(STATE["symbol"], qty, side, tp, stop)
             trade_meta["order_id"] = oid
             with _lock:
                 STATE["open_trade"] = trade_meta
-            _log_trade(sig.action, sig.reason, sig.details, {**trade_meta, "executed": True})
+                STATE["markers"].append(marker)
+                STATE["markers"] = STATE["markers"][-100:]
+            _log_trade(sig.action, sig.reason + note, sig.details, {**trade_meta, "executed": True})
         except Exception as e:
             with _lock:
                 STATE["last_error"] = f"order failed: {e}"
             _log_trade(sig.action, sig.reason + f"  [ORDER FAILED: {e}]", sig.details, {**trade_meta, "executed": False})
     else:
-        _log_trade(sig.action, sig.reason, sig.details, {**trade_meta, "executed": False, "signal_only": True})
+        with _lock:
+            STATE["markers"].append(marker)
+            STATE["markers"] = STATE["markers"][-100:]
+        _log_trade(sig.action, sig.reason + note, sig.details, {**trade_meta, "executed": False, "signal_only": True})
 
 
 def loop():
@@ -198,7 +250,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     threading.Thread(target=loop, daemon=True).start()
     port = int(os.environ.get("PORT", "8000"))
-    print(f"Bot API listening on :{port}")
+    print(f"Bot API listening on :{port}  (24h={TRADE_24H})")
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 
