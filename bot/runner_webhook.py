@@ -25,6 +25,7 @@ STATE = {
     "total_points": 0.0, "total_dollars": 0.0, "wins": 0, "losses": 0,
     "open_trade": None, "trades": [], "events": [],
     "last_signal": None, "last_price": None, "last_error": None,
+    "last_vwap": None, "last_ema9": None, "last_ema21": None,
 }
 
 def _load():
@@ -103,7 +104,14 @@ def handle_signal(body):
     try: price = float(body.get("price"))
     except (TypeError, ValueError): return {"ok": False, "error": "price invalido"}
     STATE["last_price"]=round(price,2)
-    STATE["last_signal"]={"time": _now(), "action": action, "price": round(price,2)}
+    # indicadores reales si TradingView los manda en el webhook (vwap, ema9, ema21)
+    for _k in ("vwap","ema9","ema21"):
+        _v = body.get(_k)
+        if _v is not None:
+            try: STATE["last_"+_k] = round(float(_v),2)
+            except (TypeError, ValueError): pass
+    STATE["last_signal"]={"time": _now(), "action": action, "price": round(price,2),
+                          "vwap": STATE.get("last_vwap"), "ema9": STATE.get("last_ema9"), "ema21": STATE.get("last_ema21")}
     if action in ("TICK","PRICE"):
         if STATE["open_trade"]:
             update_trade(price)
